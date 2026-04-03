@@ -18,9 +18,7 @@ async function bootstrap() {
   // ── Swagger / OpenAPI ────────────────────────────────────────────────────
   const config = new DocumentBuilder()
     .setTitle('Booking System API')
-    .setDescription(
-      'ระบบจอง Event รองรับ concurrency สูง — Lua atomic seat claim, Waitlist, Auto-promote',
-    )
+    .setDescription('ระบบจอง Event')
     .setVersion('1.0')
     .addTag('Events', 'จัดการ Event และ capacity')
     .addTag('Bookings', 'จอง / ยกเลิก / เช็คสถานะ Waitlist')
