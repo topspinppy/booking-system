@@ -14,10 +14,6 @@ import {
  * รับ domain events จาก EventEmitter แล้วทำงานต่อ
  * เช่น ส่ง email, push notification, webhook, logging ฯลฯ
  *
- * วิธีเพิ่ม email notification:
- *   1. inject MailService เข้ามา
- *   2. เรียก mailService.sendPromotionEmail(event.userId, event.eventName)
- *      ใน handlePromoted()
  */
 @Injectable()
 export class BookingListener {
