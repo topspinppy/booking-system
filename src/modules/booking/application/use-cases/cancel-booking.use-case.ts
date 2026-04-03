@@ -6,7 +6,8 @@ import {
   BadRequestException,
   Logger,
 } from '@nestjs/common';
-import { IUseCase } from '../../../../domain/use-cases/base.use-case';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+import type { IUseCase } from '../../../../domain/use-cases/base.use-case';
 import {
   BookingEntity,
   BookingStatus,
@@ -19,23 +20,23 @@ import { WAITLIST_REPOSITORY } from '../../domain/repositories/waitlist.reposito
 import type { IEventRepository } from '../../../event/domain/repositories/event.repository.interface';
 import { EVENT_REPOSITORY } from '../../../event/domain/repositories/event.repository.interface';
 import { RedisService } from '../../../../infrastructure/redis/redis.service';
-import { DistributedLockService } from '../../../../infrastructure/lock/distributed-lock.service';
 import { CancelBookingDto } from '../dto/cancel-booking.dto';
+import {
+  BOOKING_EVENTS,
+  BookingCancelledEvent,
+  BookingPromotedEvent,
+} from '../../domain/events/booking.events';
 
 /**
- * Cancel Booking Use Case — also handles waitlist promotion:
+ * Cancel Booking Use Case — cancellation + auto-promote from waitlist.
  *
- *  1. Acquire lock for the event
- *  2. Validate: booking exists, belongs to user, is cancellable
- *  3. Mark booking as CANCELLED
- *  4. INCR Redis seat counter
- *  5. Check waitlist → if someone is waiting, promote them:
- *       a. Pop first user from Redis waitlist
- *       b. Update WaitlistEntity status → PROMOTED
- *       c. Create a new CONFIRMED BookingEntity for the promoted user
- *       d. DECR seat counter back (seat is now taken by promoted user)
- *  6. If no waitlist, increment DB availableSeats
- *  7. Release lock
+ *  1. Validate: booking exists, belongs to user, is cancellable
+ *  2. Mark booking → CANCELLED  →  emit booking.cancelled
+ *  3. Redis releaseSeat (Lua: won't exceed capacity ceiling)
+ *  4. Pop next user from waitlist (ZPOPMIN)
+ *     ├─ found → PROMOTED + new booking + claimSeat
+ *     │          + emit booking.promoted  ← listener ส่ง email/push ได้
+ *     └─ empty → increment DB availableSeats
  */
 @Injectable()
 export class CancelBookingUseCase implements IUseCase<
@@ -49,91 +50,92 @@ export class CancelBookingUseCase implements IUseCase<
     private readonly bookingRepo: IBookingRepository,
     @Inject(WAITLIST_REPOSITORY)
     private readonly waitlistRepo: IWaitlistRepository,
-    @Inject(EVENT_REPOSITORY) private readonly eventRepo: IEventRepository,
+    @Inject(EVENT_REPOSITORY)
+    private readonly eventRepo: IEventRepository,
     private readonly redisService: RedisService,
-    private readonly lockService: DistributedLockService,
+    private readonly eventEmitter: EventEmitter2,
   ) {}
 
   async execute(input: CancelBookingDto): Promise<BookingEntity> {
     const { bookingId, userId } = input;
 
-    // Fetch booking first (outside lock) for validation
     const booking = await this.bookingRepo.findById(bookingId);
     if (!booking)
       throw new NotFoundException(`Booking "${bookingId}" not found`);
     if (booking.userId !== userId)
       throw new ForbiddenException('You do not own this booking');
-    if (booking.status === BookingStatus.CANCELLED) {
+    if (booking.status === BookingStatus.CANCELLED)
       throw new BadRequestException('Booking is already cancelled');
-    }
-    if (booking.status === BookingStatus.WAITLISTED) {
+    if (booking.status === BookingStatus.WAITLISTED)
       throw new BadRequestException(
         'Use remove-from-waitlist for waitlisted entries',
       );
-    }
 
-    return this.lockService.withLock(
-      `event:${booking.eventId}:booking`,
-      async () => {
-        // ── Cancel the booking ───────────────────────────────────────────────
-        const cancelled = await this.bookingRepo.updateStatus(
-          bookingId,
-          BookingStatus.CANCELLED,
-          {
-            cancelledAt: new Date(),
-          },
+    const event = await this.eventRepo.findById(booking.eventId);
+    const capacity = event?.capacity ?? Number.MAX_SAFE_INTEGER;
+
+    // ── Cancel ──────────────────────────────────────────────────────────────
+    const cancelled = await this.bookingRepo.updateStatus(
+      bookingId,
+      BookingStatus.CANCELLED,
+      { cancelledAt: new Date() },
+    );
+
+    this.eventEmitter.emit(
+      BOOKING_EVENTS.CANCELLED,
+      new BookingCancelledEvent(bookingId, userId, booking.eventId),
+    );
+
+    await this.redisService.releaseSeat(booking.eventId, capacity);
+
+    const promotedUserId = await this.redisService.popNextFromWaitlist(
+      booking.eventId,
+    );
+
+    if (promotedUserId) {
+      const waitlistEntry = await this.waitlistRepo.findByUserAndEvent(
+        promotedUserId,
+        booking.eventId,
+      );
+
+      if (waitlistEntry) {
+        await this.waitlistRepo.updateStatus(
+          waitlistEntry.id,
+          WaitlistStatus.PROMOTED,
+          { promotedAt: new Date() },
         );
 
-        // ── Restore seat in Redis ────────────────────────────────────────────
-        await this.redisService.incrementSeats(booking.eventId);
+        const promoted = await this.bookingRepo.create({
+          userId: promotedUserId,
+          eventId: booking.eventId,
+          status: BookingStatus.PROMOTED,
+          confirmedAt: new Date(),
+        });
 
-        // ── Promote from waitlist (if any) ───────────────────────────────────
-        const promotedUserId = await this.redisService.popNextFromWaitlist(
-          booking.eventId,
-        );
+        await this.redisService.tryClaimSeat(booking.eventId);
 
-        if (promotedUserId) {
-          // Find the DB waitlist record
-          const waitlistEntry = await this.waitlistRepo.findByUserAndEvent(
+        // ── แจ้ง user ที่ได้รับการ promote ────────────────────────────────
+        this.eventEmitter.emit(
+          BOOKING_EVENTS.PROMOTED,
+          new BookingPromotedEvent(
             promotedUserId,
             booking.eventId,
-          );
-
-          if (waitlistEntry) {
-            // Mark waitlist record as promoted
-            await this.waitlistRepo.updateStatus(
-              waitlistEntry.id,
-              WaitlistStatus.PROMOTED,
-              {
-                promotedAt: new Date(),
-              },
-            );
-
-            // Create a confirmed booking for the promoted user
-            await this.bookingRepo.create({
-              userId: promotedUserId,
-              eventId: booking.eventId,
-              status: BookingStatus.PROMOTED,
-              confirmedAt: new Date(),
-            });
-
-            // Seat is taken by promoted user — decrement back
-            await this.redisService.decrementSeats(booking.eventId);
-
-            this.logger.log(
-              `Waitlist PROMOTED: user=${promotedUserId} event=${booking.eventId}`,
-            );
-          }
-        } else {
-          // No one on waitlist — reflect seat in DB
-          await this.eventRepo.incrementAvailableSeats(booking.eventId);
-        }
+            event?.name ?? '',
+            promoted.id,
+          ),
+        );
 
         this.logger.log(
-          `Booking CANCELLED: id=${bookingId} event=${booking.eventId}`,
+          `Waitlist PROMOTED: user=${promotedUserId} event=${booking.eventId}`,
         );
-        return cancelled;
-      },
+      }
+    } else {
+      await this.eventRepo.incrementAvailableSeats(booking.eventId);
+    }
+
+    this.logger.log(
+      `Booking CANCELLED: id=${bookingId} event=${booking.eventId}`,
     );
+    return cancelled;
   }
 }

@@ -1,0 +1,287 @@
+{
+  "info": {
+    "name": "Booking System API",
+    "description": "ระบบจอง Event รองรับ concurrency สูง — Lua atomic seat claim, Waitlist, Auto-promote\n\n## วิธีใช้\n1. รัน `docker compose up` แล้วรอ API ขึ้น\n2. เรียก **Create Event** ก่อน → copy `id` มาใส่ตัวแปร `eventId`\n3. เรียก **Book Seat** ด้วย `userId` และ `eventId`\n4. เช็คสถานะด้วย **Get Booking Status**",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "_exporter_id": "booking-system"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000", "type": "string" },
+    { "key": "eventId", "value": "", "type": "string", "description": "ใส่ id ของ event ที่สร้างแล้ว" },
+    { "key": "userId1", "value": "11111111-1111-1111-1111-111111111111", "type": "string" },
+    { "key": "userId2", "value": "22222222-2222-2222-2222-222222222222", "type": "string" },
+    { "key": "bookingId", "value": "", "type": "string", "description": "ใส่ id ของ booking ที่ต้องการยกเลิก" }
+  ],
+  "item": [
+    {
+      "name": "Events",
+      "item": [
+        {
+          "name": "Create Event",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const res = pm.response.json();",
+                  "if (res.id) {",
+                  "  pm.collectionVariables.set('eventId', res.id);",
+                  "  console.log('✅ eventId set:', res.id);",
+                  "}",
+                  "pm.test('Status 201', () => pm.response.to.have.status(201));",
+                  "pm.test('Has id', () => pm.expect(res.id).to.be.a('string'));",
+                  "pm.test('availableSeats = capacity', () => pm.expect(res.availableSeats).to.equal(res.capacity));"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"NestJS Workshop 2025\",\n  \"description\": \"เรียนรู้ NestJS + TypeORM + Redis\",\n  \"location\": \"Bangkok\",\n  \"startDate\": \"2025-09-01T09:00:00.000Z\",\n  \"endDate\": \"2025-09-01T17:00:00.000Z\",\n  \"capacity\": 5\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/events", "host": ["{{baseUrl}}"], "path": ["events"] }
+          }
+        },
+        {
+          "name": "Get Event (seats + waitlist size)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const res = pm.response.json();",
+                  "pm.test('Has availableSeats', () => pm.expect(res.availableSeats).to.be.a('number'));",
+                  "pm.test('Has waitlistSize', () => pm.expect(res.waitlistSize).to.be.a('number'));",
+                  "console.log(`Seats: ${res.availableSeats} | Waitlist: ${res.waitlistSize}`);"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/events/{{eventId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["events", "{{eventId}}"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Bookings",
+      "item": [
+        {
+          "name": "Book Seat (User 1)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 201', () => pm.response.to.have.status(201));",
+                  "const res = pm.response.json();",
+                  "pm.test('Has status field', () => pm.expect(res.status).to.be.oneOf(['confirmed', 'waitlisted']));",
+                  "if (res.status === 'confirmed' && res.booking?.id) {",
+                  "  pm.collectionVariables.set('bookingId', res.booking.id);",
+                  "  console.log('✅ CONFIRMED — bookingId:', res.booking.id);",
+                  "} else {",
+                  "  console.log('🟡 WAITLISTED — position:', res.position);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId1}}\",\n  \"eventId\": \"{{eventId}}\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/bookings", "host": ["{{baseUrl}}"], "path": ["bookings"] }
+          }
+        },
+        {
+          "name": "Book Seat (User 2)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 201', () => pm.response.to.have.status(201));",
+                  "const res = pm.response.json();",
+                  "console.log(`User2 → ${res.status}`, res.status === 'waitlisted' ? `position: ${res.position}` : '');"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId2}}\",\n  \"eventId\": \"{{eventId}}\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/bookings", "host": ["{{baseUrl}}"], "path": ["bookings"] }
+          }
+        },
+        {
+          "name": "Get Booking Status (User 1)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const res = pm.response.json();",
+                  "pm.test('Has type', () => pm.expect(res.type).to.be.a('string'));",
+                  "console.log('Status:', res.type, res.currentPosition ? `(position: ${res.currentPosition})` : '');"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/bookings/status/{{userId1}}/{{eventId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["bookings", "status", "{{userId1}}", "{{eventId}}"]
+            }
+          }
+        },
+        {
+          "name": "Get Booking Status (User 2 — check waitlist position)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const res = pm.response.json();",
+                  "if (res.type === 'waitlisted') {",
+                  "  console.log(`🟡 User2 is WAITING at position: ${res.currentPosition}`);",
+                  "} else if (res.type === 'promoted') {",
+                  "  console.log('🎉 User2 was PROMOTED — booking:', res.bookingId);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/bookings/status/{{userId2}}/{{eventId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["bookings", "status", "{{userId2}}", "{{eventId}}"]
+            }
+          }
+        },
+        {
+          "name": "Cancel Booking (User 1) → triggers auto-promote",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 200', () => pm.response.to.have.status(200));",
+                  "const res = pm.response.json();",
+                  "pm.test('Status is cancelled', () => pm.expect(res.status).to.equal('cancelled'));",
+                  "console.log('✅ Cancelled. User2 should now be PROMOTED — check status endpoint.');"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"bookingId\": \"{{bookingId}}\",\n  \"userId\": \"{{userId1}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bookings/cancel",
+              "host": ["{{baseUrl}}"],
+              "path": ["bookings", "cancel"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Error Cases",
+      "item": [
+        {
+          "name": "Book Same Event Twice (409 Conflict)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "pm.test('Status 409', () => pm.response.to.have.status(409));",
+                  "console.log('✅ Correct — double booking rejected:', pm.response.json().message);"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"userId\": \"{{userId1}}\",\n  \"eventId\": \"{{eventId}}\"\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/bookings", "host": ["{{baseUrl}}"], "path": ["bookings"] }
+          }
+        },
+        {
+          "name": "Get Event Not Found (404)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": ["pm.test('Status 404', () => pm.response.to.have.status(404));"]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/events/00000000-0000-0000-0000-000000000000",
+              "host": ["{{baseUrl}}"],
+              "path": ["events", "00000000-0000-0000-0000-000000000000"]
+            }
+          }
+        },
+        {
+          "name": "Invalid Body — Missing Fields (400)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": ["pm.test('Status 400', () => pm.response.to.have.status(400));"]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{}" },
+            "url": { "raw": "{{baseUrl}}/bookings", "host": ["{{baseUrl}}"], "path": ["bookings"] }
+          }
+        }
+      ]
+    }
+  ]
+}

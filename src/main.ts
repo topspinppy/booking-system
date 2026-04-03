@@ -1,21 +1,40 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  // Global validation pipe — enforces class-validator rules on all DTOs
+  // ── Global Validation Pipe ───────────────────────────────────────────────
   app.useGlobalPipes(
     new ValidationPipe({
-      whitelist: true, // strip unknown properties
+      whitelist: true,
       forbidNonWhitelisted: true,
-      transform: true, // auto-transform plain objects to DTO class instances
+      transform: true,
     }),
   );
 
+  // ── Swagger / OpenAPI ────────────────────────────────────────────────────
+  const config = new DocumentBuilder()
+    .setTitle('Booking System API')
+    .setDescription(
+      'ระบบจอง Event รองรับ concurrency สูง — Lua atomic seat claim, Waitlist, Auto-promote',
+    )
+    .setVersion('1.0')
+    .addTag('Events', 'จัดการ Event และ capacity')
+    .addTag('Bookings', 'จอง / ยกเลิก / เช็คสถานะ Waitlist')
+    .build();
+
+  const document = SwaggerModule.createDocument(app, config);
+  SwaggerModule.setup('docs', app, document, {
+    swaggerOptions: { persistAuthorization: true },
+  });
+
   const port = process.env.PORT ?? 3000;
   await app.listen(port);
-  console.log(`🚀 Booking API running on http://localhost:${port}`);
+  console.log(`🚀 Booking API  → http://localhost:${port}`);
+  console.log(`📖 Swagger UI   → http://localhost:${port}/docs`);
+  console.log(`📄 OpenAPI JSON → http://localhost:${port}/docs-json`);
 }
 void bootstrap();

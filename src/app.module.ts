@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { DatabaseModule } from './infrastructure/database/database.module';
@@ -13,8 +14,9 @@ import { BookingModule } from './modules/booking/booking.module';
       isGlobal: true,
       envFilePath: '.env',
     }),
+    EventEmitterModule.forRoot({ wildcard: false, global: true }),
     DatabaseModule,
-    RedisModule, // @Global() — available everywhere without re-importing
+    RedisModule,
     EventModule,
     BookingModule,
   ],
