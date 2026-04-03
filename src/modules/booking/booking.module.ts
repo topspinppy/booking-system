@@ -8,21 +8,23 @@ import { BOOKING_REPOSITORY } from './domain/repositories/booking.repository.int
 import { WAITLIST_REPOSITORY } from './domain/repositories/waitlist.repository.interface';
 import { CreateBookingUseCase } from './application/use-cases/create-booking.use-case';
 import { CancelBookingUseCase } from './application/use-cases/cancel-booking.use-case';
+import { GetBookingStatusUseCase } from './application/use-cases/get-booking-status.use-case';
+import { BookingListener } from './application/listeners/booking.listener';
 import { BookingController } from './presentation/booking.controller';
 import { EventModule } from '../event/event.module';
-import { DistributedLockModule } from '../../infrastructure/lock/distributed-lock.module';
 
 @Module({
   imports: [
     TypeOrmModule.forFeature([BookingEntity, WaitlistEntity]),
     EventModule,
-    DistributedLockModule,
   ],
   providers: [
     { provide: BOOKING_REPOSITORY, useClass: BookingRepository },
     { provide: WAITLIST_REPOSITORY, useClass: WaitlistRepository },
     CreateBookingUseCase,
     CancelBookingUseCase,
+    GetBookingStatusUseCase,
+    BookingListener,
   ],
   controllers: [BookingController],
 })

@@ -1,30 +1,79 @@
 import { Injectable, Inject } from '@nestjs/common';
 import type Redis from 'ioredis';
+import { DistributedLockService } from '../lock/distributed-lock.service';
 
 @Injectable()
 export class RedisService {
-  constructor(@Inject('REDIS_CLIENT') private readonly redis: Redis) {}
+  constructor(
+    @Inject('REDIS_CLIENT') private readonly redis: Redis,
+    private readonly lock: DistributedLockService,
+  ) {}
 
-  // ── Seat counter (atomic) ────────────────────────────────────────────────
+  /** Same key for every seat mutation so cancel / booking / rollback cannot interleave. */
+  private seatLockKey(eventId: string): string {
+    return `seat-counter:${eventId}`;
+  }
+
+  private seatsKey(eventId: string): string {
+    return `event:${eventId}:seats`;
+  }
 
   /** Set available seats for an event (called when event is created/updated) */
   async initSeats(eventId: string, capacity: number): Promise<void> {
-    await this.redis.set(`event:${eventId}:seats`, capacity);
+    await this.redis.set(this.seatsKey(eventId), String(capacity));
   }
 
-  /** Atomically decrement seats. Returns remaining seats AFTER decrement. */
+  /**
+   * Try to reserve one seat.
+   * Returns remaining seats (>= 0), or -1 if none left.
+   */
+  async tryClaimSeat(eventId: string): Promise<number> {
+    const key = this.seatsKey(eventId);
+    return this.lock.withLock(this.seatLockKey(eventId), async () => {
+      const raw = await this.redis.get(key);
+      const n = raw !== null ? Number.parseInt(raw, 10) : Number.NaN;
+      if (raw === null || Number.isNaN(n) || n <= 0) {
+        return -1;
+      }
+      return this.redis.decr(key);
+    });
+  }
+
+  /**
+   * Release one seat (e.g. cancel). Never increments above `capacity`.
+   */
+  async releaseSeat(eventId: string, capacity: number): Promise<number> {
+    const key = this.seatsKey(eventId);
+    return this.lock.withLock(this.seatLockKey(eventId), async () => {
+      const raw = await this.redis.get(key);
+      let current = raw !== null ? Number.parseInt(raw, 10) : 0;
+      if (Number.isNaN(current)) current = 0;
+      if (current >= capacity) {
+        return current;
+      }
+      return this.redis.incr(key);
+    });
+  }
+
+  /** Decrement seats by 1 (remaining after decrement). */
   async decrementSeats(eventId: string): Promise<number> {
-    return this.redis.decr(`event:${eventId}:seats`);
+    const key = this.seatsKey(eventId);
+    return this.lock.withLock(this.seatLockKey(eventId), async () =>
+      this.redis.decr(key),
+    );
   }
 
-  /** Atomically increment seats (on booking cancellation). */
+  /** Increment seats by 1 (e.g. rollback or cancel without waitlist promotion). */
   async incrementSeats(eventId: string): Promise<number> {
-    return this.redis.incr(`event:${eventId}:seats`);
+    const key = this.seatsKey(eventId);
+    return this.lock.withLock(this.seatLockKey(eventId), async () =>
+      this.redis.incr(key),
+    );
   }
 
   async getAvailableSeats(eventId: string): Promise<number | null> {
-    const val = await this.redis.get(`event:${eventId}:seats`);
-    return val !== null ? parseInt(val, 10) : null;
+    const val = await this.redis.get(this.seatsKey(eventId));
+    return val !== null ? Number.parseInt(val, 10) : null;
   }
 
   async addToWaitlist(eventId: string, userId: string): Promise<void> {
@@ -67,7 +116,7 @@ export class RedisService {
     await this.redis.del(key);
   }
 
-  /** Evaluate a Lua script atomically. */
+  /** Evaluate a Lua script atomically (generic escape hatch). */
   async eval(script: string, keys: string[], args: string[]): Promise<unknown> {
     return this.redis.eval(script, keys.length, ...keys, ...args);
   }

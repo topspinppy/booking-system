@@ -6,7 +6,7 @@ import {
   BadRequestException,
   Logger,
 } from '@nestjs/common';
-import { IUseCase } from '../../../../domain/use-cases/base.use-case';
+import type { IUseCase } from '../../../../domain/use-cases/base.use-case';
 import {
   BookingEntity,
   BookingStatus,
@@ -23,7 +23,6 @@ import type { IEventRepository } from '../../../event/domain/repositories/event.
 import { EVENT_REPOSITORY } from '../../../event/domain/repositories/event.repository.interface';
 import { EventStatus } from '../../../event/domain/entities/event.entity';
 import { RedisService } from '../../../../infrastructure/redis/redis.service';
-import { DistributedLockService } from '../../../../infrastructure/lock/distributed-lock.service';
 import { CreateBookingDto } from '../dto/create-booking.dto';
 
 export type BookingResult =
@@ -31,20 +30,16 @@ export type BookingResult =
   | { status: 'waitlisted'; waitlist: WaitlistEntity; position: number };
 
 /**
- * Create Booking Use Case — concurrency-safe booking flow:
+ * Create Booking Use Case
  *
- *  1. Acquire distributed lock for the event  → serialises concurrent requests
- *  2. Guard: event exists and is published
- *  3. Guard: user hasn't already booked this event (double-booking check)
- *  4. Atomically DECR Redis seat counter
- *     a. seats >= 0  → create CONFIRMED booking + decrement DB availableSeats
- *     b. seats < 0   → restore counter, add user to WAITLIST (Redis + DB)
- *  5. Release lock (via finally)
+ * Seat claim: `RedisService.tryClaimSeat` uses a short Redis lock per event
+ * plus plain GET/DECR so the flow is readable; all seat INCR/DECR paths share
+ * the same lock key so they cannot interleave.
  *
- * Defense layers against double-booking & race conditions:
- *  - Distributed lock   (Layer 1: serialises per-event requests)
- *  - Redis atomic DECR  (Layer 2: atomic seat reservation)
- *  - DB partial index   (Layer 3: unique (userId, eventId) where status != cancelled)
+ * Defense layers:
+ *  1. Redis tryClaimSeat + shared seat lock key
+ *  2. DB unique partial index — (userId, eventId) WHERE status != 'cancelled'
+ *  3. DB QueryRunner — catch constraint error, rollback seat on conflict
  */
 @Injectable()
 export class CreateBookingUseCase implements IUseCase<
@@ -58,57 +53,49 @@ export class CreateBookingUseCase implements IUseCase<
     private readonly bookingRepo: IBookingRepository,
     @Inject(WAITLIST_REPOSITORY)
     private readonly waitlistRepo: IWaitlistRepository,
-    @Inject(EVENT_REPOSITORY) private readonly eventRepo: IEventRepository,
+    @Inject(EVENT_REPOSITORY)
+    private readonly eventRepo: IEventRepository,
     private readonly redisService: RedisService,
-    private readonly lockService: DistributedLockService,
   ) {}
 
   async execute(input: CreateBookingDto): Promise<BookingResult> {
     const { userId, eventId } = input;
 
-    return this.lockService.withLock(`event:${eventId}:booking`, async () => {
-      // ── Guard 1: event must exist and be published ──────────────────────
-      const event = await this.eventRepo.findById(eventId);
-      if (!event) throw new NotFoundException(`Event "${eventId}" not found`);
-      if (event.status !== EventStatus.PUBLISHED) {
-        throw new BadRequestException(
-          `Event "${event.name}" is not accepting bookings`,
-        );
-      }
-
-      // ── Guard 2: prevent double-booking ─────────────────────────────────
-      const existing = await this.bookingRepo.findByUserAndEvent(
-        userId,
-        eventId,
+    // ── Guard 1: event must exist and be published ──────────────────────────
+    const event = await this.eventRepo.findById(eventId);
+    if (!event) throw new NotFoundException(`Event "${eventId}" not found`);
+    if (event.status !== EventStatus.PUBLISHED) {
+      throw new BadRequestException(
+        `Event "${event.name}" is not accepting bookings`,
       );
-      if (existing) {
-        if (existing.status === BookingStatus.CONFIRMED) {
-          throw new ConflictException('You have already booked this event');
-        }
-        if (existing.status === BookingStatus.WAITLISTED) {
-          throw new ConflictException(
-            'You are already on the waitlist for this event',
-          );
-        }
-      }
+    }
 
-      // ── Guard 3: check if already on waitlist ───────────────────────────
-      const existingWaitlist = await this.waitlistRepo.findByUserAndEvent(
-        userId,
-        eventId,
+    // ── Guard 2: prevent double-booking (fast DB check) ─────────────────────
+    const [existing, existingWaitlist] = await Promise.all([
+      this.bookingRepo.findByUserAndEvent(userId, eventId),
+      this.waitlistRepo.findByUserAndEvent(userId, eventId),
+    ]);
+
+    if (existing?.status === BookingStatus.CONFIRMED) {
+      throw new ConflictException('You have already booked this event');
+    }
+    if (existing?.status === BookingStatus.WAITLISTED) {
+      throw new ConflictException(
+        'You are already on the waitlist for this event',
       );
-      if (existingWaitlist?.status === WaitlistStatus.WAITING) {
-        throw new ConflictException(
-          'You are already on the waitlist for this event',
-        );
-      }
+    }
+    if (existingWaitlist?.status === WaitlistStatus.WAITING) {
+      throw new ConflictException(
+        'You are already on the waitlist for this event',
+      );
+    }
 
-      // ── Seat reservation: atomic DECR in Redis ──────────────────────────
-      const remainingAfterDecr =
-        await this.redisService.decrementSeats(eventId);
+    // ── Seat reservation (Redis lock + GET / DECR) ─────────────────────────
+    const remaining = await this.redisService.tryClaimSeat(eventId);
 
-      if (remainingAfterDecr >= 0) {
-        // ✅ Seat secured — create confirmed booking
+    if (remaining >= 0) {
+      // ✅ Seat claimed in Redis — write to DB
+      try {
         const booking = await this.bookingRepo.create({
           userId,
           eventId,
@@ -116,35 +103,46 @@ export class CreateBookingUseCase implements IUseCase<
           confirmedAt: new Date(),
         });
 
-        // Update DB seat count (non-blocking, Redis is source of truth for speed)
+        // Sync DB counter (non-blocking, Redis is source of truth for speed)
         await this.eventRepo.decrementAvailableSeats(eventId);
 
         this.logger.log(
-          `Booking CONFIRMED: user=${userId} event=${eventId} seats_left=${remainingAfterDecr}`,
+          `Booking CONFIRMED: user=${userId} event=${eventId} seats_left=${remaining}`,
         );
         return { status: 'confirmed', booking };
-      } else {
-        // ❌ No seats — restore counter and add to waitlist
+      } catch (err: unknown) {
+        // DB unique constraint violation → another request for same user+event
+        // snuck through the guard (between read and write). Release seat back.
+        const isUniqueViolation =
+          err instanceof Error && err.message.includes('duplicate key');
+
+        if (isUniqueViolation) {
+          await this.redisService.incrementSeats(eventId);
+          throw new ConflictException('You have already booked this event');
+        }
+
+        // Unknown error — release seat and rethrow
         await this.redisService.incrementSeats(eventId);
-
-        const position = (await this.redisService.getWaitlistSize(eventId)) + 1;
-
-        // Add to Redis waitlist (sorted set, score = timestamp for FIFO)
-        await this.redisService.addToWaitlist(eventId, userId);
-
-        // Persist waitlist entry to DB
-        const waitlist = await this.waitlistRepo.create({
-          userId,
-          eventId,
-          status: WaitlistStatus.WAITING,
-          position,
-        });
-
-        this.logger.log(
-          `User WAITLISTED: user=${userId} event=${eventId} position=${position}`,
-        );
-        return { status: 'waitlisted', waitlist, position };
+        throw err;
       }
+    }
+
+    // ❌ No seats — add to waitlist
+    const position = (await this.redisService.getWaitlistSize(eventId)) + 1;
+
+    // Add to Redis waitlist (sorted set, score = timestamp → FIFO order)
+    await this.redisService.addToWaitlist(eventId, userId);
+
+    const waitlist = await this.waitlistRepo.create({
+      userId,
+      eventId,
+      status: WaitlistStatus.WAITING,
+      position,
     });
+
+    this.logger.log(
+      `User WAITLISTED: user=${userId} event=${eventId} position=${position}`,
+    );
+    return { status: 'waitlisted', waitlist, position };
   }
 }
