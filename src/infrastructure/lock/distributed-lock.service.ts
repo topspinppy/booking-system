@@ -9,23 +9,21 @@ import type Redis from 'ioredis';
 import { randomUUID } from 'crypto';
 
 /**
- * Distributed Lock using Redis SET NX EX (single-node Redlock pattern).
+ * Distributed lock ด้วย Redis SET NX EX (แบบ single-node Redlock).
  *
  * Flow:
  *  acquire() → SET lock:<key> <token> NX EX <ttl>
- *  release() → Lua: if GET == token then DEL (atomic check-and-delete)
+ *  release() → ถ้า GET == token แล้วค่อย DEL (check-and-delete แบบ atomic)
  *
- * This prevents:
- *  - Race conditions (only one holder at a time)
- *  - Stale locks (auto-expire via TTL)
- *  - Accidental release by wrong owner (token check)
+ * ป้องกัน:
+ *  - race condition (มีแค่ผู้ถือ lock พร้อมกันได้ทีละคน)
+ *  - lock ค้าง (หมดอายุอัตโนมัติด้วย TTL)
+ *  - ปล่อย lock ผิดเจ้าของ (เช็ค token)
  */
 @Injectable()
 export class DistributedLockService {
   private readonly logger = new Logger(DistributedLockService.name);
   private readonly ttlMs: number;
-
-  // Lua script: atomically release only if the token matches
   private readonly RELEASE_SCRIPT = `
     if redis.call("GET", KEYS[1]) == ARGV[1] then
       return redis.call("DEL", KEYS[1])
@@ -42,11 +40,11 @@ export class DistributedLockService {
   }
 
   /**
-   * Acquire a distributed lock for the given key.
-   * Retries up to maxRetries times with exponential backoff.
+   * ขอ distributed lock สำหรับ key ที่กำหนด
+   * ลองใหม่ได้สูงสุด maxRetries ครั้ง พร้อม exponential backoff
    *
-   * @returns token string — must be passed to release()
-   * @throws ServiceUnavailableException if lock cannot be acquired
+   * @returns สตริง token — ต้องส่งต่อให้ release()
+   * @throws ServiceUnavailableException ถ้าได้ lock ไม่สำเร็จ
    */
   async acquire(
     key: string,
@@ -70,7 +68,7 @@ export class DistributedLockService {
         return token;
       }
 
-      // Exponential backoff with jitter
+      // exponential backoff ร่วมกับ jitter
       const delay = retryDelayMs * Math.pow(1.5, attempt) + Math.random() * 50;
       await this.sleep(delay);
     }
@@ -81,8 +79,8 @@ export class DistributedLockService {
   }
 
   /**
-   * Release a lock. Only releases if the token matches (prevents releasing
-   * a lock owned by another process after TTL expiry).
+   * ปล่อย lock — ทำได้เฉพาะเมื่อ token ตรงกัน (กันปล่อย lock ที่ process อื่น
+   * เป็นเจ้าของหลัง TTL หมดแล้วถูกยึดใหม่)
    */
   async release(key: string, token: string): Promise<void> {
     const lockKey = `lock:${key}`;
@@ -102,8 +100,8 @@ export class DistributedLockService {
   }
 
   /**
-   * Convenience wrapper — runs fn() while holding the lock.
-   * Always releases the lock in a finally block.
+   * wrapper สะดวก — รัน fn() ขณะถือ lock
+   * ปล่อย lock ใน finally เสมอ
    */
   async withLock<T>(
     key: string,
