@@ -28,7 +28,6 @@ export class WaitlistEntity extends BaseEntity {
   })
   status: WaitlistStatus;
 
-  /** Position in the waitlist at the time of joining (1-indexed). */
   @Column({ type: 'int' })
   position: number;
 

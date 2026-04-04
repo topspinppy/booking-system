@@ -9,7 +9,6 @@ export class RedisService {
     private readonly lock: DistributedLockService,
   ) {}
 
-  /** Same key for every seat mutation so cancel / booking / rollback cannot interleave. */
   private seatLockKey(eventId: string): string {
     return `seat-counter:${eventId}`;
   }
@@ -18,15 +17,10 @@ export class RedisService {
     return `event:${eventId}:seats`;
   }
 
-  /** Set available seats for an event (called when event is created/updated) */
   async initSeats(eventId: string, capacity: number): Promise<void> {
     await this.redis.set(this.seatsKey(eventId), String(capacity));
   }
 
-  /**
-   * Try to reserve one seat.
-   * Returns remaining seats (>= 0), or -1 if none left.
-   */
   async tryClaimSeat(eventId: string): Promise<number> {
     const key = this.seatsKey(eventId);
     return this.lock.withLock(this.seatLockKey(eventId), async () => {
@@ -39,9 +33,6 @@ export class RedisService {
     });
   }
 
-  /**
-   * Release one seat (e.g. cancel). Never increments above `capacity`.
-   */
   async releaseSeat(eventId: string, capacity: number): Promise<number> {
     const key = this.seatsKey(eventId);
     return this.lock.withLock(this.seatLockKey(eventId), async () => {
@@ -55,7 +46,6 @@ export class RedisService {
     });
   }
 
-  /** Decrement seats by 1 (remaining after decrement). */
   async decrementSeats(eventId: string): Promise<number> {
     const key = this.seatsKey(eventId);
     return this.lock.withLock(this.seatLockKey(eventId), async () =>
@@ -63,7 +53,6 @@ export class RedisService {
     );
   }
 
-  /** Increment seats by 1 (e.g. rollback or cancel without waitlist promotion). */
   async incrementSeats(eventId: string): Promise<number> {
     const key = this.seatsKey(eventId);
     return this.lock.withLock(this.seatLockKey(eventId), async () =>
@@ -87,7 +76,6 @@ export class RedisService {
 
   async popNextFromWaitlist(eventId: string): Promise<string | null> {
     const result = await this.redis.zpopmin(`event:${eventId}:waitlist`, 1);
-    // zpopmin returns [member, score, ...] or []
     return result.length > 0 ? result[0] : null;
   }
 
@@ -116,7 +104,6 @@ export class RedisService {
     await this.redis.del(key);
   }
 
-  /** Evaluate a Lua script atomically (generic escape hatch). */
   async eval(script: string, keys: string[], args: string[]): Promise<unknown> {
     return this.redis.eval(script, keys.length, ...keys, ...args);
   }

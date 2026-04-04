@@ -1,10 +1,3 @@
-/**
- * Domain Events for Booking
- *
- * ใช้กับ @nestjs/event-emitter เพื่อแจ้งระบบอื่นๆ เมื่อมีการเปลี่ยนแปลง
- * ตัวอย่าง listener: ส่ง email, push notification, webhook ฯลฯ
- */
-
 export const BOOKING_EVENTS = {
   CONFIRMED: 'booking.confirmed',
   CANCELLED: 'booking.cancelled',

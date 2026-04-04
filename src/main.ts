@@ -6,7 +6,6 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  // ── Global Validation Pipe ───────────────────────────────────────────────
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
@@ -15,7 +14,6 @@ async function bootstrap() {
     }),
   );
 
-  // ── Swagger / OpenAPI ────────────────────────────────────────────────────
   const config = new DocumentBuilder()
     .setTitle('Booking System API')
     .setDescription('ระบบจอง Event')

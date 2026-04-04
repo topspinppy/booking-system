@@ -28,7 +28,6 @@ export class CreateEventUseCase implements IUseCase<
       status: EventStatus.PUBLISHED,
     });
 
-    // Seed the Redis seat counter — this is the fast path for booking checks
     await this.redisService.initSeats(event.id, event.capacity);
 
     return event;

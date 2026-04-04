@@ -8,18 +8,6 @@ import { ConfigService } from '@nestjs/config';
 import type Redis from 'ioredis';
 import { randomUUID } from 'crypto';
 
-/**
- * Distributed lock ด้วย Redis SET NX EX (แบบ single-node Redlock).
- *
- * Flow:
- *  acquire() → SET lock:<key> <token> NX EX <ttl>
- *  release() → ถ้า GET == token แล้วค่อย DEL (check-and-delete แบบ atomic)
- *
- * ป้องกัน:
- *  - race condition (มีแค่ผู้ถือ lock พร้อมกันได้ทีละคน)
- *  - lock ค้าง (หมดอายุอัตโนมัติด้วย TTL)
- *  - ปล่อย lock ผิดเจ้าของ (เช็ค token)
- */
 @Injectable()
 export class DistributedLockService {
   private readonly logger = new Logger(DistributedLockService.name);
@@ -39,13 +27,6 @@ export class DistributedLockService {
     this.ttlMs = this.config.get<number>('LOCK_TTL_MS', 10000);
   }
 
-  /**
-   * ขอ distributed lock สำหรับ key ที่กำหนด
-   * ลองใหม่ได้สูงสุด maxRetries ครั้ง พร้อม exponential backoff
-   *
-   * @returns สตริง token — ต้องส่งต่อให้ release()
-   * @throws ServiceUnavailableException ถ้าได้ lock ไม่สำเร็จ
-   */
   async acquire(
     key: string,
     maxRetries = 10,
@@ -68,7 +49,6 @@ export class DistributedLockService {
         return token;
       }
 
-      // exponential backoff ร่วมกับ jitter
       const delay = retryDelayMs * Math.pow(1.5, attempt) + Math.random() * 50;
       await this.sleep(delay);
     }
@@ -78,10 +58,6 @@ export class DistributedLockService {
     );
   }
 
-  /**
-   * ปล่อย lock — ทำได้เฉพาะเมื่อ token ตรงกัน (กันปล่อย lock ที่ process อื่น
-   * เป็นเจ้าของหลัง TTL หมดแล้วถูกยึดใหม่)
-   */
   async release(key: string, token: string): Promise<void> {
     const lockKey = `lock:${key}`;
     const released = await this.redis.eval(
@@ -99,10 +75,6 @@ export class DistributedLockService {
     }
   }
 
-  /**
-   * wrapper สะดวก — รัน fn() ขณะถือ lock
-   * ปล่อย lock ใน finally เสมอ
-   */
   async withLock<T>(
     key: string,
     fn: () => Promise<T>,

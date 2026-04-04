@@ -28,7 +28,6 @@ export class EventEntity extends BaseEntity {
   @Column({ type: 'int' })
   capacity: number;
 
-  /** Available seats — persisted to DB; also cached in Redis for speed. */
   @Column({ type: 'int' })
   availableSeats: number;
 

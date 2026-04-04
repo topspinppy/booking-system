@@ -27,17 +27,6 @@ import {
   BookingPromotedEvent,
 } from '../../domain/events/booking.events';
 
-/**
- * Cancel Booking Use Case — cancellation + auto-promote from waitlist.
- *
- *  1. Validate: booking exists, belongs to user, is cancellable
- *  2. Mark booking → CANCELLED  →  emit booking.cancelled
- *  3. Redis releaseSeat (Lua: won't exceed capacity ceiling)
- *  4. Pop next user from waitlist (ZPOPMIN)
- *     ├─ found → PROMOTED + new booking + claimSeat
- *     │          + emit booking.promoted  ← listener ส่ง email/push ได้
- *     └─ empty → increment DB availableSeats
- */
 @Injectable()
 export class CancelBookingUseCase implements IUseCase<
   CancelBookingDto,
@@ -74,7 +63,6 @@ export class CancelBookingUseCase implements IUseCase<
     const event = await this.eventRepo.findById(booking.eventId);
     const capacity = event?.capacity ?? Number.MAX_SAFE_INTEGER;
 
-    // ── Cancel ──────────────────────────────────────────────────────────────
     const cancelled = await this.bookingRepo.updateStatus(
       bookingId,
       BookingStatus.CANCELLED,
@@ -114,7 +102,6 @@ export class CancelBookingUseCase implements IUseCase<
 
         await this.redisService.tryClaimSeat(booking.eventId);
 
-        // ── แจ้ง user ที่ได้รับการ promote ────────────────────────────────
         this.eventEmitter.emit(
           BOOKING_EVENTS.PROMOTED,
           new BookingPromotedEvent(

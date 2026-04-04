@@ -29,18 +29,6 @@ export type BookingResult =
   | { status: 'confirmed'; booking: BookingEntity }
   | { status: 'waitlisted'; waitlist: WaitlistEntity; position: number };
 
-/**
- * Use case สร้างการจอง
- *
- * การจองที่นั่ง: `RedisService.tryClaimSeat` ใช้ lock สั้นๆ ใน Redis ต่อ event
- * ร่วมกับ GET/DECR แบบตรงๆ เพื่อให้ flow อ่านง่าย; ทุก path ที่ INCR/DECR ที่นั่ง
- * ใช้ lock key เดียวกันจึงไม่สลับกลางทางได้
- *
- * ชั้นป้องกัน:
- *  1. Redis tryClaimSeat + lock key ที่นั่งร่วมกัน
- *  2. unique partial index ใน DB — (userId, eventId) WHERE status != 'cancelled'
- *  3. DB QueryRunner — จับ error constraint แล้ว rollback ที่นั่งเมื่อชนกัน
- */
 @Injectable()
 export class CreateBookingUseCase implements IUseCase<
   CreateBookingDto,
@@ -61,7 +49,6 @@ export class CreateBookingUseCase implements IUseCase<
   async execute(input: CreateBookingDto): Promise<BookingResult> {
     const { userId, eventId } = input;
 
-    // เงื่อนไข 1: event ต้องมีอยู่และเป็นสถานะ published
     const event = await this.eventRepo.findById(eventId);
     if (!event) throw new NotFoundException(`Event "${eventId}" not found`);
     if (event.status !== EventStatus.PUBLISHED) {
@@ -70,7 +57,6 @@ export class CreateBookingUseCase implements IUseCase<
       );
     }
 
-    // เงื่อนไข 2: กันจองซ้ำ (เช็ค DB แบบเร็ว)
     const [existing, existingWaitlist] = await Promise.all([
       this.bookingRepo.findByUserAndEvent(userId, eventId),
       this.waitlistRepo.findByUserAndEvent(userId, eventId),
@@ -90,11 +76,9 @@ export class CreateBookingUseCase implements IUseCase<
       );
     }
 
-    // จองที่นั่ง (Redis lock + GET / DECR)
     const remaining = await this.redisService.tryClaimSeat(eventId);
 
     if (remaining >= 0) {
-      // ✅ จองที่นั่งใน Redis แล้ว — เขียนลง DB
       try {
         const booking = await this.bookingRepo.create({
           userId,
@@ -103,7 +87,6 @@ export class CreateBookingUseCase implements IUseCase<
           confirmedAt: new Date(),
         });
 
-        // sync ตัวนับใน DB (ไม่บล็อก; Redis เป็นตัวจริงเรื่องความเร็ว)
         await this.eventRepo.decrementAvailableSeats(eventId);
 
         this.logger.log(
@@ -111,8 +94,6 @@ export class CreateBookingUseCase implements IUseCase<
         );
         return { status: 'confirmed', booking };
       } catch (err: unknown) {
-        // ละเมิด unique ใน DB → request อื่นสำหรับ user+event เดียวกัน
-        // แทรกระหว่างอ่านกับเขียน คืนที่นั่งกลับ
         const isUniqueViolation =
           err instanceof Error && err.message.includes('duplicate key');
 
@@ -121,16 +102,13 @@ export class CreateBookingUseCase implements IUseCase<
           throw new ConflictException('You have already booked this event');
         }
 
-        // error อื่น — คืนที่นั่งแล้วโยนต่อ
         await this.redisService.incrementSeats(eventId);
         throw err;
       }
     }
 
-    // ❌ ไม่มีที่นั่ง — เพิ่มในรายชื่อรอ
     const position = (await this.redisService.getWaitlistSize(eventId)) + 1;
 
-    // เพิ่มใน Redis waitlist (sorted set, score = เวลา → ลำดับ FIFO)
     await this.redisService.addToWaitlist(eventId, userId);
 
     const waitlist = await this.waitlistRepo.create({

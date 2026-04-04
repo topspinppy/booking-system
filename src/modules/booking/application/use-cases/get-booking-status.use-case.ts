@@ -19,19 +19,12 @@ export type BookingStatusResult =
   | {
       type: 'waitlisted';
       waitlistId: string;
-      position: number; // ลำดับตอนเข้าคิว
-      currentPosition: number; // ลำดับปัจจุบัน (real-time จาก Redis)
+      position: number;
+      currentPosition: number;
     }
   | { type: 'cancelled' }
   | { type: 'not_found' };
 
-/**
- * Get Booking Status Use Case
- *
- * User ที่รออยู่ใน WAITING ใช้ endpoint นี้เช็คว่า:
- *  - ยังรืออยู่ไหม? อยู่ลำดับเท่าไหร่?
- *  - ได้รับการ promote แล้วหรือยัง?
- */
 @Injectable()
 export class GetBookingStatusUseCase implements IUseCase<
   GetBookingStatusInput,
@@ -48,7 +41,6 @@ export class GetBookingStatusUseCase implements IUseCase<
   async execute(input: GetBookingStatusInput): Promise<BookingStatusResult> {
     const { userId, eventId } = input;
 
-    // ── ตรวจ booking ก่อน ────────────────────────────────────────────────────
     const booking = await this.bookingRepo.findByUserAndEvent(userId, eventId);
 
     if (booking) {
@@ -70,7 +62,6 @@ export class GetBookingStatusUseCase implements IUseCase<
       }
     }
 
-    // ── ตรวจ waitlist ────────────────────────────────────────────────────────
     const waitlist = await this.waitlistRepo.findByUserAndEvent(
       userId,
       eventId,
@@ -79,7 +70,6 @@ export class GetBookingStatusUseCase implements IUseCase<
     if (!waitlist) return { type: 'not_found' };
 
     if (waitlist.status === WaitlistStatus.PROMOTED) {
-      // Promoted แล้วแต่ booking record อาจยังไม่ sync — คืน promoted
       const promotedBooking = await this.bookingRepo.findByUserAndEvent(
         userId,
         eventId,
@@ -92,7 +82,6 @@ export class GetBookingStatusUseCase implements IUseCase<
     }
 
     if (waitlist.status === WaitlistStatus.WAITING) {
-      // ดึง current position จาก Redis (real-time)
       const currentPosition = await this.redisService.getWaitlistPosition(
         eventId,
         userId,
@@ -101,8 +90,8 @@ export class GetBookingStatusUseCase implements IUseCase<
       return {
         type: 'waitlisted',
         waitlistId: waitlist.id,
-        position: waitlist.position, // ลำดับตอนเข้าคิว
-        currentPosition: currentPosition + 1, // ลำดับปัจจุบัน (0-indexed → 1-indexed)
+        position: waitlist.position,
+        currentPosition: currentPosition + 1,
       };
     }
 

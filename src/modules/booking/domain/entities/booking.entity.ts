@@ -6,13 +6,9 @@ export enum BookingStatus {
   CONFIRMED = 'confirmed',
   CANCELLED = 'cancelled',
   WAITLISTED = 'waitlisted',
-  PROMOTED = 'promoted', // was waitlisted → got a seat
+  PROMOTED = 'promoted',
 }
 
-/**
- * Unique index on (userId, eventId) is the DB-level safety net
- * against double-booking (in addition to the Redis distributed lock).
- */
 @Entity('bookings')
 @Index(['userId', 'eventId'], {
   unique: true,

@@ -1,90 +1,66 @@
 # Booking System API
 
-ระบบจองงาน Event ที่รองรับ concurrency สูง สร้างด้วย NestJS + TypeORM + Redis บน Clean Architecture
+API สำหรับจองที่นั่งงานอีเวนต์ มีคิวรอ (waitlist) และยกเลิกแล้วดึงคนถัดไปเข้ามาแทนอัตโนมัติ
+สร้างด้วย **NestJS**, เก็บข้อมูลหลักใน **PostgreSQL**, ใช้ **Redis** ช่วยนับที่นั่งและล็อกเวลามีหลายคนจองพร้อมกัน
 
 ---
 
-## Tech Stack
+## ใช้อะไรบ้าง
 
-| Layer | Technology |
-|---|---|
-| Framework | NestJS 11 |
-| Language | TypeScript 5 (strict mode) |
-| Database | PostgreSQL 16 |
-| Cache / Lock | Redis 7 |
-| ORM | TypeORM |
-| Validation | class-validator, class-transformer |
-| Containerization | Docker, Docker Compose |
+| type           | Stack                                                 |
+| -------------- | ----------------------------------------------------- |
+| framework      | NestJS 11                                             |
+| language       | TypeScript 5 (โหมด strict)                            |
+| db             | PostgreSQL 16                                         |
+| Redis          | Redis 7 ผ่าน `ioredis`                                |
+| orm            | TypeORM                                               |
+| Validation     | class-validator, class-transformer                    |
+| เอกสาร API     | Swagger (เปิดดูที่ `/docs`)                           |
+| Event          | `@nestjs/event-emitter` (ไว้ต่อยอด เช่น ส่งแจ้งเตือน) |
+| รันด้วย Docker | Docker Compose                                        |
 
 ---
 
-## Architecture
+## โครงโปรเจกต์ (แบบเข้าใจง่าย)
 
-โปรเจกต์นี้ใช้ **Clean Architecture** แบ่งเป็น 4 ชั้น:
+โค้ดแบ่งชั้นตาม **Clean Architecture** โดยคร่าวๆ คือ: กฎธุรกิจอยู่กลางๆ ไม่ผูกกับ Nest โดยตรง ส่วนที่ต่อกับ DB / Redis / HTTP อยู่รอบนอก
 
 ```
 src/
-├── domain/                           ← Business logic (ไม่ขึ้นกับ framework)
-│   ├── entities/base.entity.ts       ← Base entity (uuid, createdAt, updatedAt, deletedAt)
-│   ├── repositories/                 ← Repository interfaces
-│   └── use-cases/base.use-case.ts   ← IUseCase<TInput, TOutput>
-│
-├── infrastructure/                   ← Framework / External services
-│   ├── database/database.module.ts   ← TypeORM async config
-│   ├── redis/                        ← RedisModule (@Global) + RedisService
-│   ├── lock/                         ← DistributedLockService (Redis SET NX)
-│   └── repositories/base.repository.ts
-│
+├── domain/                    ← กฎและสัญญา (entity ฐาน, interface repository, use case ฐาน)
+├── infrastructure/            ← ต่อจริงกับ PostgreSQL, Redis, distributed lock
 ├── modules/
-│   ├── event/                        ← Event module
-│   │   ├── domain/                   ← Entity, Repository interface
-│   │   ├── infrastructure/           ← TypeORM Repository implementation
-│   │   ├── application/              ← Use Cases, DTOs
-│   │   └── presentation/            ← Controller
-│   │
-│   └── booking/                      ← Booking module
-│       ├── domain/                   ← Booking + Waitlist Entity, Interfaces
-│       ├── infrastructure/           ← TypeORM Repository implementations
-│       ├── application/              ← Use Cases (Create, Cancel), DTOs
-│       └── presentation/            ← Controller
-│
-└── common/
-    └── exceptions/                   ← Custom exceptions
+│   ├── event/                 ← สร้าง/ดูอีเวนต์
+│   └── booking/               ← จอง, ยกเลิก, เช็คสถานะ + listener รับ event
+└── common/                    ← exception ร่วม
 ```
+
+แต่ละโมดูล (`event`, `booking`) จะมี `domain` → `application` (use case, DTO) → `infrastructure` (TypeORM) → `presentation` (controller) ตามลำดับ
 
 ---
 
-## Concurrency & Safety Design
+## เวลาหลายคนกดจองพร้อมกัน ระบบกันยังไง
 
-ระบบมี **3 ชั้นป้องกัน** Race Condition และ Double-Booking ซ้อนกัน:
+สั้นๆ คือ **ไม่ให้ตัวเลขที่นั่งใน Redis เพี้ยน** และ **ไม่ให้คนเดียวกันจองซ้ำได้** โดยมีสามชั้นช่วยกัน:
 
-### Layer 1 — Distributed Lock (Redis SET NX EX)
+### 1) ล็อกใน Redis (ก่อนจะไปแตะตัวนับที่นั่ง)
 
-ทุก booking request ต้องผ่าน lock ก่อน จะมีแค่ 1 process ต่อ event ที่เข้า critical section ได้พร้อมกัน
+เวลาจะอ่านหรือลด/เพิ่มค่า `event:<id>:seats` จะเข้า critical section ทีละคิวต่ออีเวนต์
+คีย์ล็อกจริงใน Redis หน้าตาประมาณ **`lock:seat-counter:<eventId>`** (โค้ดส่ง logical key `seat-counter:<eventId>` เข้าไป แล้ว service ใส่ prefix `lock:` ให้)
 
-```
-acquire lock(event:<id>:booking)
-  → ตรวจสอบ / จอง / waitlist
-release lock (finally)
-```
+- ล็อกหมดอายุเองตาม `LOCK_TTL_MS` (ค่าเริ่มต้น 10 วินาที) กันติดค้าง
+- ถ้าได้ล็อกไม่ทันจะลองใหม่สูงสุด 10 ครั้ง โดยรอนานขึ้นเรื่อยๆ แบบถ่วงน้ำหนัก
+- ปล่อยล็อกด้วย Lua ที่เช็ค token ก่อนลบ เพื่อกันคนอื่นมาปลดล็อกแทน
 
-- Auto-expire หลัง `LOCK_TTL_MS` (default 10 วินาที) ป้องกัน deadlock
-- Retry ด้วย exponential backoff สูงสุด 10 ครั้ง
-- Token-based release (Lua script) ป้องกัน process อื่น unlock แทน
+### 2) การ “ขอที่นั่ง” ทำในขณะถือล็อก
 
-### Layer 2 — Redis Atomic DECR
+ขั้นตอนคือ: ดูค่าใน Redis ก่อน → ถ้าไม่มีตัวเลขหรือเหลือไม่พอถือว่าเต็ม → ถ้ายังพอให้ลดตัวนับลงหนึ่ง
 
-นับ seat แบบ atomic ไม่มีทาง "อ่านค่าเก่า" พร้อมกัน 2 process:
+ส่วนการใส่ชื่อเข้า waitlist (ZADD + แถวใน DB) เกิด **หลัง** ช่วงล็อกตัวนับแล้ว ส่วนชั้นถัดไปช่วยรองรับความผิดพลาด
 
-```
-DECR event:<id>:seats
-  → ได้ค่า >= 0 → จองสำเร็จ
-  → ได้ค่า < 0  → restore counter → เข้า Waitlist
-```
+### 3) Unique index ใน PostgreSQL
 
-### Layer 3 — PostgreSQL Partial Unique Index
-
-เป็น safety net สุดท้ายในระดับ Database:
+ถ้ามีอะไรหลุดรอดมา DB ยังมีกฎว่า **ห้ามมี booking ซ้ำสำหรับ user + event เดียวกัน** ถ้าสถานะยังไม่ใช่ cancelled:
 
 ```sql
 UNIQUE (userId, eventId) WHERE status NOT IN ('cancelled')
@@ -92,70 +68,52 @@ UNIQUE (userId, eventId) WHERE status NOT IN ('cancelled')
 
 ---
 
-## Booking Flow
+## Flow การใช้งานหลัก
 
-### จองที่นั่ง
+### จองที่นั่ง (`POST /bookings`)
 
-```
-POST /bookings
-  │
-  ├─ Acquire distributed lock (event:<id>:booking)
-  ├─ Guard: event published?
-  ├─ Guard: already booked / on waitlist?
-  ├─ Redis DECR seats
-  │    ├─ seats >= 0 → CREATE confirmed booking
-  │    │               DECR availableSeats ใน DB
-  │    │               → { status: "confirmed" }
-  │    │
-  │    └─ seats < 0  → INCR seats (restore)
-  │                    ADD to Redis waitlist (ZADD score=timestamp)
-  │                    CREATE waitlist record ใน DB
-  │                    → { status: "waitlisted", position: N }
-  │
-  └─ Release lock (finally)
-```
+- เช็คว่ามีอีเวนต์และเปิดรับจองอยู่
+- เช็คว่ายังไม่เคยจองซ้ำ / ไม่อยู่ในคิวรอแล้ว
+- ขอที่นั่งจาก Redis (ในขณะถือล็อกตามด้านบน)
+  - **ได้ที่นั่ง** → สร้าง booking สถานะ confirmed และลด `availableSeats` ใน DB
+  - **เต็ม** → ใส่ Redis waitlist + สร้างแถว waitlist ใน DB แล้วบอกลำดับคิว
 
-### ยกเลิกการจอง + Auto-Promote Waitlist
+### ยกเลิก (`DELETE /bookings/cancel`)
 
-```
-DELETE /bookings/cancel
-  │
-  ├─ Acquire distributed lock (event:<id>:booking)
-  ├─ UPDATE booking → CANCELLED
-  ├─ Redis INCR seats
-  ├─ ZPOPMIN waitlist (ดึงคนแรกในคิว)
-  │    ├─ มีคน → UPDATE waitlist → PROMOTED
-  │    │         CREATE new CONFIRMED booking
-  │    │         DECR seats กลับ (seat ถูกใช้โดย promoted user)
-  │    │
-  │    └─ ไม่มีคน → INCR availableSeats ใน DB
-  │
-  └─ Release lock (finally)
-```
+- เช็คว่าเป็นเจ้าของ booking จริง และยกเลิกได้ตามสถานะ
+- ตั้งสถานะ cancelled แล้วคืนที่นั่งใน Redis (มีล็อกเหมือนเดิม)
+- ดึงคนแรกในคิว waitlist ถ้ามี → อัปเดตสถานะ waitlist → สร้าง booking ใหม่ให้คนนั้น และ sync ตัวนับ Redis ให้ตรงกับที่นั่งที่ถูกใช้
+- ถ้าไม่มีใครในคิว → เพิ่ม `availableSeats` ใน DB แทน
+
+### Event ภายในแอป (log / ต่อยอด)
+
+ตอนนี้มีการยิง event จริงๆ ตอน **ยกเลิก** และตอน **promote จาก waitlist**
+`BookingListener` จะ log ให้เห็นใน console ส่วน event แบบ “จองสำเร็จ / เข้าคิว” ยังมี class ไว้ในโค้ดเผื่อต่อระบบแจ้งเตือนหรือ audit ภายหลัง
 
 ---
 
-## Getting Started
+## เริ่มใช้งาน
 
-### Prerequisites
+### สิ่งที่ต้องมี
 
-- Docker & Docker Compose
-- Node.js 20+
-- npm
+- Docker + Docker Compose
+- Node.js 20 ขึ้นไป
+- `npm` (ใน repo มี `pnpm-lock.yaml` ด้วย ถ้าใช้ pnpm ก็รัน `pnpm install` ได้)
 
-### 1. ติดตั้ง dependencies
+### 1) ติดตั้งแพ็กเกจ
 
 ```bash
 npm install
+# หรือ: pnpm install
 ```
 
-### 2. ตั้งค่า Environment
+### 2) ตั้งค่า `.env`
 
 ```bash
 cp .env.example .env
 ```
 
-แก้ไข `.env` ตามต้องการ:
+จากนั้นแก้ค่าตามเครื่องคุณ ตัวอย่าง:
 
 ```env
 PORT=3000
@@ -176,31 +134,41 @@ REDIS_PASSWORD=redis_secret
 LOCK_TTL_MS=10000
 ```
 
-### 3. รันด้วย Docker Compose
+### 3) รัน Docker
 
 ```bash
-# รัน PostgreSQL + Redis + App ทั้งหมด
+# รันทั้งแอป + PostgreSQL + Redis
 docker compose up
 
-# รันแค่ PostgreSQL + Redis (สำหรับ local dev)
+# หรือรันแค่ DB กับ Redis แล้วรันแอปบนเครื่องเอง
 docker compose up postgres redis
 ```
 
-### 4. รัน App (local dev)
+### 4) รันแอป (dev)
 
 ```bash
 npm run start:dev
 ```
 
-API พร้อมใช้ที่ `http://localhost:3000`
+เปิดใช้ API ที่ `http://localhost:3000`
+
+### ดูเอกสาร API แบบมีฟอร์มลองยิง
+
+| ลิงก์                                                              | คำอธิบาย        |
+| ------------------------------------------------------------------ | ----------------- |
+| [http://localhost:3000/docs](http://localhost:3000/docs)           | Swagger UI        |
+| [http://localhost:3000/docs-json](http://localhost:3000/docs-json) | OpenAPI เป็น JSON |
 
 ---
 
-## API Reference
+## API สรุปสั้นๆ
 
 ### Events
 
-#### สร้าง Event
+**สร้างอีเวนต์** `POST /events`
+ตอนนี้พฤติกรรมคือสร้างแล้วถือว่า **เปิดรับจองเลย (`published`)** และตั้งค่า Redis ให้เหลือที่นั่งเท่ากับ `capacity`
+
+ตัวอย่าง body:
 
 ```http
 POST /events
@@ -216,7 +184,7 @@ Content-Type: application/json
 }
 ```
 
-**Response `201`**
+ตอบ `201` แบบคร่าวๆ:
 
 ```json
 {
@@ -229,17 +197,17 @@ Content-Type: application/json
 }
 ```
 
-#### ดู Event + จำนวนที่นั่ง
-
-```http
-GET /events/:id
-```
-
-**Response `200`**
+**ดูรายละเอียดอีเวนต์** `GET /events/:id`
+ได้ทั้งข้อมูลอีเวนต์, ที่นั่งว่างจาก Redis, และจำนวนคนในคิว waitlist
 
 ```json
 {
-  "event": { "id": "uuid", "name": "...", "capacity": 100, "availableSeats": 87 },
+  "event": {
+    "id": "uuid",
+    "name": "...",
+    "capacity": 100,
+    "availableSeats": 87
+  },
   "availableSeats": 87,
   "waitlistSize": 3
 }
@@ -249,167 +217,138 @@ GET /events/:id
 
 ### Bookings
 
-#### จองที่นั่ง
-
-```http
-POST /bookings
-Content-Type: application/json
-
-{
-  "userId": "uuid",
-  "eventId": "uuid"
-}
-```
-
-**Response `201` — จองสำเร็จ**
+**จอง** `POST /bookings`
 
 ```json
-{
-  "status": "confirmed",
-  "booking": {
-    "id": "uuid",
-    "userId": "uuid",
-    "eventId": "uuid",
-    "status": "confirmed",
-    "confirmedAt": "..."
-  }
-}
+{ "userId": "uuid", "eventId": "uuid" }
 ```
 
-**Response `201` — ที่นั่งเต็ม (เข้า Waitlist)**
+- จองได้ → `201` พร้อม `status: "confirmed"` และ object `booking`
+- ที่นั่งเต็ม → ยัง `201` แต่ `status: "waitlisted"` พร้อม `waitlist` และ `position`
+
+ถ้ามีปัญหามักเจอแบบนี้:
+
+| HTTP  | ความหมาย                              |
+| ----- | ----------------------------------------- |
+| `404` | หา event ไม่เจอ                           |
+| `400` | อีเวนต์ยังไม่เปิดรับจอง                   |
+| `409` | จองซ้ำหรืออยู่ในคิวแล้ว                   |
+| `503` | แน่นมาก จับล็อก Redis ไม่ทัน ลองใหม่ได้ |
+
+**ยกเลิก** `DELETE /bookings/cancel`
 
 ```json
-{
-  "status": "waitlisted",
-  "waitlist": { "id": "uuid", "userId": "uuid", "eventId": "uuid", "position": 4 },
-  "position": 4
-}
+{ "bookingId": "uuid", "userId": "uuid" }
 ```
 
-**Error Responses**
+ถ้ายกเลิกสำเร็จได้ booking กลับมาสถานะ `cancelled` และถ้ามีคนรอ ระบบจะดึงคนแรกในคิวขึ้นมาแทนให้เอง
 
-| Status | เหตุผล |
-|---|---|
-| `404` | Event ไม่พบ |
-| `400` | Event ไม่ได้เปิดรับจอง |
-| `409` | จองซ้ำ หรืออยู่ใน Waitlist แล้ว |
-| `503` | ระบบ load สูงมาก ได้ lock ไม่ทัน (retry) |
+| HTTP  | ความหมาย                                                       |
+| ----- | ------------------------------------------------------------------ |
+| `404` | ไม่มี booking นี้                                                  |
+| `403` | user นี้ไม่ใช่เจ้าของ                                              |
+| `400` | ยกเลิกไม่ได้ เช่น ยกเลิกไปแล้ว หรือพยายามยกเลิกแถวที่เป็น waitlist |
 
-#### ยกเลิกการจอง
+**เช็คว่าตัวเองอยู่สถานะไหน** `GET /bookings/status/:userId/:eventId`
+ดึงจาก DB เป็นหลัก ถ้ายังรอคิวจะไปดูลำดับใน Redis ด้วย
 
-```http
-DELETE /bookings/cancel
-Content-Type: application/json
+ใน body จะมี field `type` บอกสถานะ:
 
-{
-  "bookingId": "uuid",
-  "userId": "uuid"
-}
-```
+| `type`       | ความหมาย                                                                               |
+| ------------ | ------------------------------------------------------------------------------------------ |
+| `confirmed`  | มีที่นั่งแล้ว                                                                              |
+| `promoted`   | เคยรอคิว แล้วได้ขึ้นมาเป็นที่นั่งจริง                                                      |
+| `waitlisted` | ยังรอ มีทั้ง `position` ใน DB กับ `currentPosition` ที่คำนวณจาก Redis (นับแบบเริ่มที่ 1) |
+| `cancelled`  | เคยจองแล้วยกเลิกไปแล้ว                                                                     |
+| `not_found`  | ไม่มีทั้ง booking ที่ยังใช้อยู่และไม่มีแถว waitlist ให้คนนี้                               |
 
-**Response `200`**
-
-```json
-{
-  "id": "uuid",
-  "status": "cancelled",
-  "cancelledAt": "..."
-}
-```
-
-> เมื่อยกเลิก ระบบจะ **auto-promote** คนแรกในคิว Waitlist โดยอัตโนมัติ
+ถ้าเจอ edge case ของสถานะ waitlist แปลกๆ อาจได้ `404` จากข้างใน use case
 
 ---
 
-## Database Schema
+## ตารางในฐานข้อมูล (สรุป)
 
 ### `events`
 
-| Column | Type | Description |
-|---|---|---|
-| id | uuid (PK) | Primary key |
-| name | varchar(255) | ชื่อ event |
-| description | text | รายละเอียด |
-| location | varchar(500) | สถานที่ |
-| startDate | timestamp | วันเริ่ม |
-| endDate | timestamp | วันจบ |
-| capacity | int | จำนวนที่นั่งทั้งหมด |
-| availableSeats | int | ที่นั่งเหลือ (sync กับ Redis) |
-| status | enum | draft / published / cancelled / completed |
-| createdAt | timestamp | auto |
-| updatedAt | timestamp | auto |
-| deletedAt | timestamp | soft delete |
+| คอลัมน์                         | ประเภท       | หมายเหตุ                                             |
+| ------------------------------- | ------------ | ---------------------------------------------------- |
+| id                              | uuid         | primary key                                          |
+| name, description, location     | text/varchar | รายละเอียดงาน                                        |
+| startDate, endDate              | timestamp    | เวลาเริ่ม–จบ                                         |
+| capacity, availableSeats        | int          | ความจุ vs ที่ว่าง (ให้สอดคล้องกับ Redis เวลารันระบบ) |
+| status                          | enum         | draft / published / cancelled / completed            |
+| createdAt, updatedAt, deletedAt | timestamp    | มี soft delete                                       |
 
 ### `bookings`
 
-| Column | Type | Description |
-|---|---|---|
-| id | uuid (PK) | Primary key |
-| userId | uuid | ผู้จอง |
-| eventId | uuid (FK) | อ้างอิง event |
-| status | enum | confirmed / cancelled / waitlisted / promoted |
-| confirmedAt | timestamp | เวลายืนยัน |
-| cancelledAt | timestamp | เวลายกเลิก |
+| คอลัมน์                  | ประเภท    | หมายเหตุ                                      |
+| ------------------------ | --------- | --------------------------------------------- |
+| userId, eventId          | uuid      | ใครจองงานไหน                                  |
+| status                   | enum      | confirmed / cancelled / waitlisted / promoted |
+| confirmedAt, cancelledAt | timestamp | เวลาที่เกี่ยวข้อง                             |
 
-> **Unique Index:** `(userId, eventId)` WHERE `status NOT IN ('cancelled')`
+กฎสำคัญ: **ห้ามซ้ำ (userId, eventId)** ถ้า status ยังไม่ใช่ cancelled
 
 ### `waitlists`
 
-| Column | Type | Description |
-|---|---|---|
-| id | uuid (PK) | Primary key |
-| userId | uuid | ผู้รอ |
-| eventId | uuid (FK) | อ้างอิง event |
-| status | enum | waiting / promoted / expired |
-| position | int | ลำดับในคิว (1-indexed) |
-| promotedAt | timestamp | เวลาที่ได้รับการ promote |
+| คอลัมน์         | ประเภท    | หมายเหตุ                     |
+| --------------- | --------- | ---------------------------- |
+| userId, eventId | uuid      | ใครรองานไหน                  |
+| status          | enum      | waiting / promoted / expired |
+| position        | int       | ลำดับในคิว (นับ 1, 2, 3, …)  |
+| promotedAt      | timestamp | เมื่อไหร่ที่ได้เลื่อนจากคิว  |
 
-> **Unique Index:** `(userId, eventId)` WHERE `status = 'waiting'`
+กฎสำคัญ: **ห้ามซ้ำ (userId, eventId)** ในสถานะ `waiting` เท่านั้น
 
 ---
 
-## Redis Key Design
+## Redis เก็บอะไรบ้าง
 
-| Key Pattern | Type | ใช้สำหรับ |
-|---|---|---|
-| `event:<id>:seats` | String | จำนวน seat ที่เหลือ (atomic counter) |
-| `event:<id>:waitlist` | Sorted Set | คิว waitlist (score = timestamp, FIFO) |
-| `lock:event:<id>:booking` | String (NX EX) | Distributed lock ต่อ event |
+| คีย์                     | ชนิด                  | ใช้ทำอะไร                           |
+| ------------------------ | --------------------- | ----------------------------------- |
+| `event:<id>:seats`       | string                | เหลือกี่ที่ (แก้ทีละทีเมื่อถือล็อก) |
+| `event:<id>:waitlist`    | sorted set            | คิวรอ เรียงตามเวลาเข้า (FIFO)       |
+| `lock:seat-counter:<id>` | string (NX + หมดอายุ) | ล็อกตอนปรับตัวนับที่นั่ง            |
 
 ---
 
-## Scripts
+## คำสั่งที่ใช้บ่อย
 
 ```bash
-# Development
-npm run start:dev      # Hot reload
-npm run start:debug    # Debug mode
+# พัฒนา
+npm run start:dev
+npm run start:debug
 
-# Build & Production
+# build / production
 npm run build
 npm run start:prod
 
-# Code Quality
-npm run lint           # ESLint check
-npm run format         # Prettier format
+# คุณภาพโค้ด
+npm run lint
+npm run format
 
-# Testing
-npm run test           # Unit tests
-npm run test:cov       # Coverage report
-npm run test:e2e       # E2E tests
+# เทส
+npm run test
+npm run test:cov
+npm run test:e2e
+
+# ทดสอบแบบหลายคนจองพร้อมกัน (ต้องรัน API + DB + Redis ก่อน)
+npm run test:concurrent
+
+# โหลดเทสด้วย k6 (ต้องใส่ EVENT_ID ของอีเวนต์จริง)
+# ตัวอย่าง: EVENT_ID=<uuid> k6 run test/load/k6-booking.js
+npm run test:load
 ```
 
 ---
 
-## VSCode Setup
+## Postman
 
-เปิด `.vscode/settings.json` ที่มาพร้อมโปรเจกต์จะได้:
+มีไฟล์ `booking-system.postman_collection.json` ให้ import แล้วตั้ง `baseUrl` ให้ชี้มาที่ API ของคุณ
 
-- **Format on Save** ด้วย Prettier
-- **ESLint auto-fix** on save
+---
 
-Extensions ที่แนะนำ:
+## VSCode
 
-- `dbaeumer.vscode-eslint`
-- `esbenp.prettier-vscode`
-- `ms-vscode.vscode-typescript-next`
+แนะนำเปิด format on save กับ Prettier และ ESLint fix on save
+ส่วนเสริมที่ใช้สะดวก: ESLint, Prettier, TypeScript (หรือตัว next ของ VS Code)
